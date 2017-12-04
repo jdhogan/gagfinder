@@ -4,7 +4,7 @@
 # Step 0: imports and functions #
 #################################
 
-print "Importing modules...",
+print "Importing modules and functions...",
 
 import time # for timing functions
 start_time = time.time()
@@ -13,38 +13,21 @@ import re # for converting chemical formulae to dictionaries and vice versa
 import sys # for getting user inputs
 import argparse # for getting user inputs
 import sqlite3 as sq # for accessing the database
+import pymzml # for handling MS data
+import numpy as np # for handling numerical operations
+import brainpy as bp # for generating theoretical isotopic distribution
+
+# get individual classes from brainpy
+iv    = bp.isotopic_variants
+pt    = bp.mass_dict.nist_mass
+elems = pt.keys()
+
 debug = False # variable for debugging
 
-if debug:
-	import timeit
-	start = timeit.default_timer()
-
-# import pymzml
-try:
-	import pymzml
-except:
-	print "You need to install the pymzML module to use this script. Please install and try again."
-	sys.exit()
-
-# import numpy
-try:
-	import numpy as np
-except:
-	print "You need to install the numpy module to use this script. Please install and try again."
-	sys.exit()
-
-# import brainpy
-try:
-	from brainpy import isotopic_variants as iv
-	from brainpy import mass_dict
-	pt    = mass_dict.nist_mass
-	elems = pt.keys()
-except:
-	print "You need to install the brainpy module to use this script. Please install and try again."
-	sys.exit()
-
-# get local packages
+# get local package
 from species import *
+
+print "Done!"
 
 ### CLASSES AND FUNCTIONS ###
 
@@ -194,519 +177,299 @@ def fmla2dict (fm, type):
 	# return
 	return dt
 
-################################
-# Step 1: check user arguments #
-################################
-
-print "Done!"
-print "Checking user arguments...",
-
-# initiate parser
-parser = argparse.ArgumentParser(description='Find isotopic clusters in GAG tandem mass spectra.')
-
-# add arguments
-parser.add_argument('-c', required=True, help='GAG class (required)')
-parser.add_argument('-i', required=True, help='Input mzML file (required)')
-parser.add_argument('-r', required=False, help='Reducing end derivatization (optional)')
-parser.add_argument('-n', type=int, required=False, help='Number of top results to return (either)')
-parser.add_argument('-p', type=float, required=False, help='Percentage of top results to return (either)')
-parser.add_argument('-a', required=False, help='Which metal is adducted (optional)')
-parser.add_argument('-t', type=int, required=False, help='Number of adducted metals (required if -a TRUE)')
-parser.add_argument('-g', required=False, help='Reagent used (optional)')
-parser.add_argument('-m', type=float, required=False, help='Precursor m/z (optional, but must be in mzML file)')
-parser.add_argument('-z', type=int, required=False, help='Precursor charge (optional, but must be in mzML file)')
-parser.add_argument('-s', type=int, required=False, help='Number of sulfate losses to consider (optional, default 0)')
-parser.add_argument('-x', required=False, help='Has the noise already been removed? (y/n)')
-
-# parse arguments
-args = parser.parse_args()
-
-# get arguments into proper variables
-gClass  = args.c
-dFile   = args.i
-fmla    = args.r
-top_n   = args.n
-top_p   = args.p
-adduct  = args.a
-nMetal  = args.t
-reag    = args.g
-pre_mz  = args.m
-pre_z   = args.z
-s_loss  = args.s
-removed = args.x
-
-# get values ready for reducing end derivatization and reagent
-df    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
-rf    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
-atoms = ['C','H','O','N','S']
-
-# check to make sure a proper GAG class was added
-if gClass not in ['HS', 'CS', 'KS']:
-	print "You must denote a GAG class, either HS, CS, or KS. Try 'python gagfinder.py --help'"
-	sys.exit()
-
-# pick a proper class number
-if gClass == 'HS':
-	cNum = 3
-elif gClass == 'CS':
-	cNum = 1
-else:
-	cNum = 4
-
-# parse the reducing end derivatization formula
-if fmla:
-	parts = re.findall(r'([A-Z][a-z]*)(\d*)', fmla.upper()) # split formula by symbol
-	for q in parts:
-		if q[0] not in atoms: # invalid symbol entered
-			print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
-			sys.exit()
-		else:
-			if q[1] == '': # only one of this atom
-				df[q[0]] += 1
+# function for summing the scans
+def sum_scans(data, spec, noise_removed):
+	counter = 0.0 # count the number of scans in the data file
+	
+	for t in data:
+		counter += 1
+		if t['ms level'] == 2:
+			if 'total ion current' in t.keys():
+				spec += t/t['total ion current']
 			else:
-				df[q[0]] += int(q[1])
+				spec += t/sum(t.i)
+	
+	spec = spec/counter
 
-# parse the reagent formula
-if reag:
-	parts = re.findall(r'([A-Z][a-z]*)(\d*)', reag.upper()) # split formula by symbol
-	for q in parts:
-		if q[0] not in atoms: # invalid symbol entered
-			print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
-			sys.exit()
-		else:
-			if q[1] == '': # only one of this atom
-				rf[q[0]] += 1
+	# noise not already removed by the user
+	if not noise_removed:
+		spec = spec.removeNoise(mode='median')
+	
+	return spec # return
+
+# function for getting information about the precursor
+def get_precursor(charge, mz, cursor, deriv_wt, weights, gag_class, adct=None, n_adct=None):
+	mass = (mz*abs(charge)) - (charge*weights['H'])
+	
+	# get proper precursor mass to test
+	if not adct:
+		n_adct    = 0
+		test_mass = mass - deriv_wt
+	else:
+		test_mass = mass - deriv_wt - (n_adct*weights[adct]) + (n_adct*weights['H'])
+	
+	# get precursor info from database
+	cursor.execute('''SELECT   cpm.id, f.value, p.value, f.monoMass
+   	       	 		  FROM     Precursors p, ClassPrecursorMap cpm, Formulae f
+	 	       	      WHERE    p.id = cpm.pId 
+    	       		  AND      f.id = p.fmId
+        	     	  AND      cpm.cId = ?
+   	        	 	  ORDER BY ABS(f.monoMass - ?) ASC
+	       	     	  LIMIT 1;''', (gag_class, test_mass))
+	row = cursor.fetchone()
+	
+	# return
+	return row
+
+# function for getting the reducing and non-reducing end info
+def get_ends(pd, gag_class):
+	n = pd['D'] + pd['U'] + pd['X'] + pd['N'] # length of GAG
+	
+	# check if dHexA exists (has to be NR end)
+	if pd['D'] > 0:
+		nonred = 'D'
+		
+		if pd['U'] == pd['N']: # we know that the reducing end is HexA because (HexA+dHexA > HexN)
+			redend = 'U'
+		else: # we know that the reducing end is HexN because (HexA+dHexA == HexN)
+			redend = 'N'
+	else:
+		if gag_class == 4: # KS
+			if pd['N'] > pd['X']:
+				nonred = 'N'
+				redend = 'N'
+			elif pd['N'] < pd['X']:
+				nonred = 'X'
+				redend = 'X'
 			else:
-				rf[q[0]] += int(q[1])
-
-# get derivatization weight
-wt = {'C':  12.0,
-      'H':  1.0078250322,
-      'O':  15.994914620,
-      'N':  14.003074004,
-      'S':  31.972071174,
-      'Na': 22.98976928,
-      'K':  38.96370649,
-      'Li': 7.01600344,
-      'Ca': 39.9625909,
-      'Mg': 23.98504170}
-dw = 0
-for q in df:
-	dw += df[q] * wt[q]
-
-# get reagent weight
-rw = 0
-for q in rf:
-	rw += rf[q] * wt[q]
-
-# check to make sure that metal adduct is appropriate
-if adduct:
-	if adduct not in ['Na', 'K', 'Li', 'Ca', 'Mg']:
-		print "\nInvalid metal adduct entered. Only Na, K, Li, Ca, and Mg are accepted. Try 'python gagfinder.py --help'"
-		sys.exit()
+				nonred = '?'
+				redend = '?'
+		else: # HS or CS
+			if pd['N'] > pd['U']: # we know that both ends are HexN
+				nonred = 'N'
+				redend = 'N'
+			elif pd['N'] < pd['U']: # we know that both ends are HexA
+				nonred = 'U'
+				redend = 'U'
+			else: # we cannot know which end is which just yet
+				nonred = '?'
+				redend = '?'
 	
-	if nMetal is None:
-		nMetal = 0
-	elif nMetal < 1:
-		print "\nYou must enter a positive integer for the number of adducted metals. Try 'python gagfinder.py --help'"
-		sys.exit()
+	# return
+	return [nonred, redend, n]
 
-# check to make sure user didn't input both a top n and a top percentile
-if top_n and top_p:
-	print "You must select either a number or a percentile to return, not both. Try 'python gagfinder.py -h'"
-	sys.exit()
-
-# check to see if the user wants to consider sulfate loss
-if not s_loss:
-	s_loss = 0
-
-# check to make sure user did input at least one of top n or top percentile
-if not top_n and not top_p:
-	print "You must select a number or a percentile to return. Try 'python gagfinder.py -h'"
-	sys.exit()
-
-# check to see if the user removed the noise to start with
-if not removed:
-	removed = False
-else:
-	# check to make sure the entry was correct
-	if removed == 'y' or removed == 'n':
-		if removed == 'y':
-			removed = True
-		else:
-			removed = False
-	else:
-		print "You must enter either 'y' or 'n' for whether the noise has been removed or not. Try 'python gagfinder.py -h'"
-		sys.exit()
-
-# print the system arguments back out to the user
-if debug:
-	print "class: %s" % (gClass)
-	print "mzML file: %s" % (dFile)
-	if 'top_n' in globals():
-		print "top %i fragments requested" % (top_n)
-	else:
-		print "top %.2f%% percent of fragments requested" % (top_p)
+# function for retrieving all fragment ions
+def get_frags(pf, pd, sl, reag, deriv, chrg, n_mono, cursor, cpid, crossmods, redend, adct=None, n_adct=None):
+	# variables to store fragment info
+	IDs   = {}
+	forms = {}
+	comps = []
 	
-	formula = ''
-	for key in df:
-		val = df[key]
-		if val > 0:
-			formula += key
-			if val > 1:
-				formula += str(val)
-	print "atoms in reducing end derivatization: %s" % (formula)
-
-############################################
-# Step 2: Load mzml file and connect to DB #
-############################################
-
-print "Done!"
-print "Loading mzml file and connecting to GAGfragDB...",
-
-# from user, under construction
-data = pymzml.run.Reader(dFile, MSn_Precision=5e-06) # get mzML file into object
-s    = pymzml.spec.Spectrum(measuredPrecision=20e-06) # initialize new Spectrum object
-
-# connect to GAGfragDB
-conn = sq.connect('../lib/GAGfragDB.db')
-c    = conn.cursor()
-
-######################
-# Step 3a: Sum scans #
-######################
-
-print "Done!"
-print "Summing scans...",
-
-counter = 0.0
-
-'''for t in data:
-	counter += 1
-	if t['ms level'] == 2:
-		t2 = t.deRef()
-		if 'total ion current' in t.keys():
-			s += t2/t2['total ion current']
-		else:
-			s += t2/sum(t2.i)'''
-
-for t in data:
-	counter += 1
-	if t['ms level'] == 2:
-		if 'total ion current' in t.keys():
-			s += t/t['total ion current']
-		else:
-			s += t/sum(t.i)
-
-s = s/counter
-
-#mn = sum([i for mz, i in s.peaks])/float(len(s.peaks))
-md = s._median([i for mz, i in s.peaks])
-
-# noise not already removed by the user
-if not removed:
-	s = s.removeNoise(mode='median')
-
-# get minimum and maximum m/z values
-ends   = s.extremeValues('mz')
-min_mz = ends[0]
-max_mz = ends[1]
-
-if debug:
-	print "Minimum m/z: " + str(min_mz)
-	print "Maximum m/z: " + str(max_mz)
-	print "Range: " + str(max_mz - min_mz)
-
-#######################################
-# Step 3b: Find precursor composition #
-#######################################
-
-print "Done!"
-print "Finding precursor composition...",
-
-# calculate precursor mass
-pre_mass = (pre_mz*abs(pre_z)) - (pre_z*wt['H'])
-
-# get proper precursor mass to test
-if not nMetal:
-	nMetal = 0
-	test_mass = pre_mass - dw
-else:
-	test_mass = pre_mass - dw - (nMetal*wt[adduct]) + (nMetal*wt['H'])
+	## first look through precursor-based fragments
+	ffDict = fmla2dict(pf, 'formula')
 	
-# get precursor info
-c.execute('''SELECT   cpm.id, f.value, p.value, f.monoMass
-   	         FROM     Precursors p, ClassPrecursorMap cpm, Formulae f
-       	     WHERE    p.id = cpm.pId 
-           	 AND      f.id = p.fmId
-             AND      cpm.cId = ?
-   	         ORDER BY ABS(f.monoMass - ?) ASC
-       	     LIMIT 1;''', (cNum, test_mass))
-row = c.fetchone()
-
-# place precursor info into variables
-id    = row[0]
-pFmla = row[1]
-pComp = row[2]
-tMass = row[3] # theoretical mass, for precision calculation
-
-#########################################################
-# Step 3c: Get reducing end/non-reducing end information #
-#########################################################
-
-print "Done!"
-print "Determining reducing end/non-reducing end information...",
-
-# convert composition into a dictionary
-pDict = fmla2dict(pComp, 'composition')
-n_pre = pDict['D'] + pDict['U'] + pDict['X'] + pDict['N']
-
-# check if dHexA exists (has to be NR end)
-if pDict['D'] > 0:
-	NR = 'D'
+	# add metal adduct info
+	if adct:
+		ffDict[adct] = n_adct
+		ffDict['H'] -= n_adct
 	
-	if pDict['U'] == pDict['N']: # we know that the reducing end is HexA because (HexA+dHexA > HexN)
-		RE = 'U'
-	else: # we know that the reducing end is HexN because (HexA+dHexA == HexN)
-		RE = 'N'
-else:
-	if cNum == 4: # KS
-		if pDict['N'] > pDict['X']:
-			NR = 'N'
-			RE = 'N'
-		elif pDict['N'] < pDict['X']:
-			NR = 'X'
-			RE = 'X'
-		else:
-			NR = '?'
-			RE = '?'
-	else: # HS or CS
-		if pDict['N'] > pDict['U']: # we know that both ends are HexN
-			NR = 'N'
-			RE = 'N'
-		elif pDict['N'] < pDict['U']: # we know that both ends are HexA
-			NR = 'U'
-			RE = 'U'
-		else: # we cannot know which end is which just yet
-			NR = '?'
-			RE = '?'
-
-#######################################################################
-# Step 3d: Get potential fragment ions based on precursor composition #
-#######################################################################
-
-print "Done!"
-print "Retrieving all potential fragment ions for precursor with composition " + pComp + "...",
-
-# generate all IDs
-all_IDs   = {}
-all_forms = {}
-all_comps = []
-
-## look through precursor-based fragments
-ffDict = fmla2dict(pFmla, 'formula')
-
-# add metal adduct info
-if adduct is not None:
-	ffDict[adduct] = nMetal
-	ffDict['H']   -= nMetal
-
-# ready to test fragments
-for i in range(2): # determine how much water to lose
-	for j in range(2): # determine whether reducing end fragment or not
-		for k in range(3): # cycle through potential hydrogen losses
-			for l in range(pDict['U'] + pDict['D'] + 1): # cycle through potential CO2 losses
-				for m in range(min(s_loss, ffDict['S'])+1): # cycle through potential SO3 losses
-					for a in range(2): # cycle through reagent possibilities
-						thDict = dict(ffDict) # copy directory of fragment
-						
-						# add reagent
-						for q in rf:
-							thDict[q] += a*rf[q]
-						
-						# H2O loss
-						thDict['H'] -= 2*i
-						thDict['O'] -= i
-						
-						# reducing end
-						for q in df:
-							thDict[q] += j*df[q]
-						
-						# hydrogen loss
-						thDict['H'] -= k
-						
-						# CO2 loss
-						thDict['C'] -= l
-						thDict['O'] -= 2*l
-						
-						# SO3 loss
-						thDict['S'] -= m
-						thDict['O'] -= 3*m
-						
-						# turn new formula dict into string
-						thFmla = dict2fmla(thDict, 'formula')
-						
-						# append alterations onto fComp
-						thComp = 'M'
-						
-						# add RE info
-						if j == 0:
-							thComp += '-RE'
-						
-						# add water loss info
-						if i == 1:
-							thComp += '-H2O'
-						elif i == 2:
-							thComp += '-2H2O'
-						
-						# add hydrogen loss info
-						if k == 1:
-							thComp += '-H'
-						elif k == 2:
-							thComp += '-2H'
-						
-						# add CO2 loss info
-						if l == 1:
-							thComp += '-CO2'
-						elif l > 1:
-							thComp += '-' + str(l) + 'CO2'
-						
-						# add SO3 loss info
-						if m == 1:
-							thComp += '-SO3'
-						elif m > 1:
-							thComp += '-' + str(m) + 'SO3'
-						
-						# add reagent info
-						if a == 1:
-							thComp += '+A'
-						
-						# check if this formula already exists
-						if thFmla not in all_forms:
-							for z in range((pre_z+1), 0):
-								dist                 = TheoreticalIsotopicPattern(iv(thDict, charge=z)).truncate_after(0.95)
-								all_IDs[(thFmla, z)] = dist
+	# ready to test fragments
+	for i in range(2): # determine how much water to lose
+		for j in range(2): # determine whether reducing end fragment or not
+			for k in range(3): # cycle through potential hydrogen losses
+				for l in range(pd['U'] + pd['D'] + 1): # cycle through potential CO2 losses
+					for m in range(min(sl, ffDict['S'])+1): # cycle through potential SO3 losses
+						for a in range(2): # cycle through reagent possibilities
+							thDict = dict(ffDict) # copy directory of fragment
 							
-							all_forms[thFmla] = [thComp]
-						else:
-							all_forms[thFmla].append(thComp)
-
-## get all child fragments
-c.execute('''SELECT   fr.value, fm.value
-   	         FROM     ChildFragments cf, Formulae fm, Fragments fr, Precursors p, ClassPrecursorMap cp
-       	     WHERE    cf.frId = fr.id
-           	 AND      cf.cpId = cp.id 
-             AND      cp.pId = p.id
-   	         AND      fr.fmId = fm.id
-       	     AND      cf.cpId = ?;''', (id,))
-
-# go through the rows
-for row in c.fetchall():
-	# get formula and convert it to dictionary
-	fComp  = row[0]
-	fFmla  = row[1]
+							# add reagent
+							for q in reag:
+								thDict[q] += a*reag[q]
+							
+							# H2O loss
+							thDict['H'] -= 2*i
+							thDict['O'] -= i
+							
+							# reducing end
+							for q in deriv:
+								thDict[q] += j*deriv[q]
+							
+							# hydrogen loss
+							thDict['H'] -= k
+							
+							# CO2 loss
+							thDict['C'] -= l
+							thDict['O'] -= 2*l
+							
+							# SO3 loss
+							thDict['S'] -= m
+							thDict['O'] -= 3*m
+							
+							# turn new formula dict into string
+							thFmla = dict2fmla(thDict, 'formula')
+							
+							# append alterations onto fComp
+							thComp = 'M'
+							
+							# add RE info
+							if j == 0:
+								thComp += '-RE'
+							
+							# add water loss info
+							if i == 1:
+								thComp += '-H2O'
+							elif i == 2:
+								thComp += '-2H2O'
+							
+							# add hydrogen loss info
+							if k == 1:
+								thComp += '-H'
+							elif k == 2:
+								thComp += '-2H'
+							
+							# add CO2 loss info
+							if l == 1:
+								thComp += '-CO2'
+							elif l > 1:
+								thComp += '-' + str(l) + 'CO2'
+							
+							# add SO3 loss info
+							if m == 1:
+								thComp += '-SO3'
+							elif m > 1:
+								thComp += '-' + str(m) + 'SO3'
+							
+							# add reagent info
+							if a == 1:
+								thComp += '+A'
+							
+							# check if this formula already exists
+							if thFmla not in forms:
+								for z in range((chrg+1), 0):
+									dist             = TheoreticalIsotopicPattern(iv(thDict, charge=z)).truncate_after(0.95)
+									IDs[(thFmla, z)] = dist
+								
+								forms[thFmla] = [thComp]
+							else:
+								forms[thFmla].append(thComp)
 	
-	if '+' in fComp: # cross-ring fragment
-		fcDict  = fmla2dict(fComp.rsplit('+', 1)[0], 'composition')
-		xr_info = fComp.rsplit('+', 1)[1]
-	else: # glycosidic fragment
-		fcDict  = fmla2dict(fComp, 'composition')
-		xr_info = ''
+	## get all child fragments
+	cursor.execute('''SELECT   fr.value, fm.value
+	   	    	      FROM     ChildFragments cf, Formulae fm, Fragments fr, Precursors p, ClassPrecursorMap cp
+	       	     	  WHERE    cf.frId = fr.id
+	       	     	  AND      cf.cpId = cp.id
+	       	     	  AND      cp.pId = p.id
+	       	     	  AND      fr.fmId = fm.id
+	       	     	  AND      cf.cpId = ?;''', (cpid,))
 	
-	ffDict = fmla2dict(fFmla, 'formula')
-	
-	# get number of FULL monosaccharides in fragment
-	n_frag = fcDict['D'] + fcDict['U'] + fcDict['X'] + fcDict['N']
-	
-	# calculate values for searching adducted metals
-	atleast = nMetal - (pDict['S'] + pDict['U'] + pDict['D']) + fcDict['S'] + fcDict['U'] + fcDict['D']
-	atmost  = fcDict['S'] + fcDict['U'] + fcDict['D']
-	
-	# calculate number of CO2 here
-	nCO2 = fcDict['U'] + fcDict['D']
-	
-	# determine if cross-ring cleavage
-	if '+' in fComp:
-		xr    = 1
+	# go through the rows
+	for row in cursor.fetchall():
+		# get formula and convert it to dictionary
+		fComp  = row[0]
+		fFmla  = row[1]
 		
-		# get info about the cross-ring monosaccharide
-		x_det = fComp.rsplit('+')[1]
-		x_ms  = x_det[0]
-		x_end = x_det[1:3]
-		x_clv = x_det[3:len(x_det)]
+		if '+' in fComp: # cross-ring fragment
+			fcDict  = fmla2dict(fComp.rsplit('+', 1)[0], 'composition')
+			xr_info = fComp.rsplit('+', 1)[1]
+		else: # glycosidic fragment
+			fcDict  = fmla2dict(fComp, 'composition')
+			xr_info = ''
 		
-		# transcribe from single letters to three-letter codes
-		if x_ms == 'D':
-			x_ms = 'dHexA'
-		elif x_ms == 'U':
-			x_ms = 'HexA'
-		elif x_ms == 'X':
-			x_ms = 'Hex'
+		ffDict = fmla2dict(fFmla, 'formula')
+		
+		# get number of FULL monosaccharides in fragment
+		n_frag = fcDict['D'] + fcDict['U'] + fcDict['X'] + fcDict['N']
+		
+		# calculate values for searching adducted metals
+		if adct:
+			atleast = n_adct - (pd['S'] + pd['U'] + pd['D']) + fcDict['S'] + fcDict['U'] + fcDict['D']
+			atmost  = fcDict['S'] + fcDict['U'] + fcDict['D']
 		else:
-			x_ms = 'HexN'
+			atleast = 0
+			atmost  = 0
+			n_adct  = 0
 		
-		atleast += xmod[gClass][x_ms][x_end][x_clv]['COOH']
-		atmost  += xmod[gClass][x_ms][x_end][x_clv]['COOH']
+		# determine if cross-ring cleavage
+		if '+' in fComp:
+			xr = 1
+			
+			# get info about the cross-ring monosaccharide
+			x_det = fComp.rsplit('+')[1]
+			x_ms  = x_det[0]
+			x_end = x_det[1:3]
+			x_clv = x_det[3:len(x_det)]
+			
+			# transcribe from single letters to three-letter codes
+			if x_ms == 'D':
+				x_ms = 'dHexA'
+			elif x_ms == 'U':
+				x_ms = 'HexA'
+			elif x_ms == 'X':
+				x_ms = 'Hex'
+			else:
+				x_ms = 'HexN'
+			
+			# for adducted metals
+			if adct:
+				atleast += xmod[gClass][x_ms][x_end][x_clv]['COOH']
+				atmost  += xmod[gClass][x_ms][x_end][x_clv]['COOH']
+		else:
+			xr = 0
 		
-		nCO2 += xmod[gClass][x_ms][x_end][x_clv]['COOH']
-	else:
-		xr = 0
-	
-	# determine if reducing end info is needed
-	if fcDict['D'] == 1: # presence of dHexA means non-reducing end fragment
-		reFrag = [0]
-	elif 'NR' in fComp and 'NRE' not in fComp: # non-reducing end fragment
-		reFrag = [0]
-	else: # easy reasons to reject reducing end all failed
-		if RE == '?': # don't know reducing end monosaccharide...this will be tricky
-			if not xr: # not cross-ring fragment...could be anything
-				reFrag = [0,1]
-			else: # cross-ring fragment
-				if n_frag == n_pre - 1: # has to be RE fragment
-					reFrag = [1]
-				else:
+		# determine if reducing end info is needed
+		if fcDict['D'] == 1: # presence of dHexA means non-reducing end fragment
+			reFrag = [0]
+		elif 'NR' in fComp and 'NRE' not in fComp: # non-reducing end fragment
+			reFrag = [0]
+		else: # easy reasons to reject reducing end all failed
+			if redend == '?': # don't know reducing end monosaccharide...this will be tricky
+				if not xr: # not cross-ring fragment...could be anything
 					reFrag = [0,1]
-		else: # do know reducing end monosaccharide
-			if n_frag % 2 == 0: # equal number of Hex/HexA and HexN
-				if RE+'RE' in fComp: # correct monosaccharide to cut into for cross-ring fragment on reducing end
-					if n_frag < n_pre - 2: # doesn't HAVE to be on the end
-						reFrag = [0,1]
-					else: # HAS to be on the end
-						reFrag = [1]
-				elif RE == 'U' and 'DRE' in fComp: # reducing end HexA
-					if n_frag == n_pre - 1: # HAS to be on the end
+				else: # cross-ring fragment
+					if n_frag == n_mono - 1: # has to be RE fragment
 						reFrag = [1]
 					else:
 						reFrag = [0,1]
-				elif not xr: # not x-ring...since equal number, can be either RE or not
-					reFrag = [0,1]
-				else: # incorrect monosaccharide to cut into
-					reFrag = [0]
-			else: # unequal number of Hex/HexA and HexN
-				sm = n_frag/2     # smaller number
-				bg = (n_frag/2)+1 # bigger number
-				
-				if fcDict[RE] == bg: # if uneven number, RE must be larger number to possibly be a RE fragment
-					if xr: # cross-ring fragment
-						if n_frag < n_pre - 2: # doesn't HAVE to be on the end
+			else: # do know reducing end monosaccharide
+				if n_frag % 2 == 0: # equal number of Hex/HexA and HexN
+					if redend+'RE' in fComp: # correct monosaccharide to cut into for cross-ring fragment on reducing end
+						if n_frag < n_mono - 2: # doesn't HAVE to be on the end
 							reFrag = [0,1]
 						else: # HAS to be on the end
 							reFrag = [1]
-					else: # glycosidic fragment
-						if n_frag < n_pre - 1: # doesn't HAVE to be on the end
-							reFrag = [0,1]
-						else: # HAS to be on the end
+					elif redend == 'U' and 'DRE' in fComp: # reducing end HexA
+						if n_frag == n_mono - 1: # HAS to be on the end
 							reFrag = [1]
-				else:
-					reFrag = [0]
-	
-	## ready to test fragments
-	for i in range(2-xr): # determine how much water to lose
-		for j in reFrag: # determine whether reducing end fragment or not
-			for k in range(-2, 1): # cycle through potential hydrogen losses/gains
-				for c in range(min(nCO2, 0) + 1):
-					for m in range(max(0, atleast), (min(nMetal, atmost)+1)): # cycle through potential metal adduction
-						for so3 in range(min(s_loss, ffDict['S'])+1): # cycle through potential SO3 losses
+						else:
+							reFrag = [0,1]
+					elif not xr: # not x-ring...since equal number, can be either RE or not
+						reFrag = [0,1]
+					else: # incorrect monosaccharide to cut into
+						reFrag = [0]
+				else: # unequal number of Hex/HexA and HexN
+					sm = n_frag/2     # smaller number
+					bg = (n_frag/2)+1 # bigger number
+					
+					if fcDict[redend] == bg: # if uneven number, RE must be larger number to possibly be a RE fragment
+						if xr: # cross-ring fragment
+							if n_frag < n_mono - 2: # doesn't HAVE to be on the end
+								reFrag = [0,1]
+							else: # HAS to be on the end
+								reFrag = [1]
+						else: # glycosidic fragment
+							if n_frag < n_mono - 1: # doesn't HAVE to be on the end
+								reFrag = [0,1]
+							else: # HAS to be on the end
+								reFrag = [1]
+					else:
+						reFrag = [0]
+		
+		## ready to test fragments
+		for i in range(2-xr): # determine how much water to lose
+			for j in reFrag: # determine whether reducing end fragment or not
+				for k in range(-2, 1): # cycle through potential hydrogen losses/gains
+					for m in range(max(0, atleast), (min(n_adct, atmost)+1)): # cycle through potential metal adduction
+						for so3 in range(min(sl, ffDict['S'])+1): # cycle through potential SO3 losses
 							thffDict = dict(ffDict) # copy directory of fragment formula
 							thfcDict = dict(fcDict) # copy directory of fragment composition
 							
@@ -716,20 +479,16 @@ for row in c.fetchall():
 							
 							# reducing end
 							if j == 1:
-								for q in df:
-									thffDict[q] += j*df[q]
+								for q in deriv:
+									thffDict[q] += j*deriv[q]
 							
 							# hydrogen loss/gain
 							thffDict['H'] += k
 							
-							# CO2 loss
-							thffDict['C'] -= c
-							thffDict['O'] -= c*2
-							
 							# metal adduction
-							if adduct is not None:
-								thffDict[adduct] = m
-								thffDict['H']   -= m
+							if adct is not None:
+								thffDict[adct] = m
+								thffDict['H'] -= m
 							
 							# sulfate loss
 							thffDict['S'] -= so3
@@ -756,195 +515,378 @@ for row in c.fetchall():
 								thComp += '-2H2O'
 							
 							# add hydrogen gain/loss info
-							sign = ''
-							if abs(k) == 1:
-								if k < 0:
-									sign = '-'
-								else:
-									sign = '+'
-								
-								thComp += sign + 'H'
-							elif abs(k) == 2:
-								if k < 0:
-									sign = '-'
-								else:
-									sign = '+'
-								
-								thComp += sign + '2H'
-							
-							# add CO2 loss info
-							if c == 1:
-								thComp += '-CO2'
-							elif c > 1:
-								thComp += '-' + str(c) + 'CO2'
+							if k < 0:
+								if k == -1:
+									thComp += '-H'
+								elif k == -2:
+									thComp += '-2H'
 							
 							# add metal adduction info
 							if m == 1:
-								thComp += '+' + adduct
+								thComp += '+' + adct
 							elif m > 1:
-								thComp += '+' + str(m) + adduct
+								thComp += '+' + str(m) + adct
 							
 							# check to see if this one has already been searched
-							if thComp not in all_comps:
-								all_comps.append(thComp)
+							if thComp not in comps:
+								comps.append(thComp)
 							
 								# check if this formula already exists
-								if thffFmla not in all_forms:
-									for z in range((pre_z+1), 0):
-										dist                   = TheoreticalIsotopicPattern(iv(thffDict, charge=z)).truncate_after(0.95)
-										all_IDs[(thffFmla, z)] = dist
+								if thffFmla not in forms:
+									for z in range((chrg+1), 0):
+										dist               = TheoreticalIsotopicPattern(iv(thffDict, charge=z)).truncate_after(0.95)
+										IDs[(thffFmla, z)] = dist
 									
-									all_forms[thffFmla] = [thComp]
+									forms[thffFmla] = [thComp]
 								else:
-									all_forms[thffFmla].append(thComp)
-
-##############################################
-# Step 3e: Score each potential fragment ion #
-##############################################
-
-print "Done!"
-print "Scoring all potential fragment ions for precursor with composition " + pComp + "...",
-
-# dictionaries to store info
-found_IDs = {}
-mono_int  = {}
-mono_mz   = {}
-errors    = {}
-'''wherecache = {}
-
-# cycle through fragments
-for j in all_IDs:
-	TID = []
-	EID = []
+									forms[thffFmla].append(thComp)
 	
-	kill = False # boolean that states if the searched m/z is in the spectrum
+	# return
+	return [IDs, forms]
+
+# function for scoring fragments
+def score_frags(IDs, spec):
+	# dictionaries for storing info
+	found = {}
+	m_int = {}
+	m_mz  = {}
+	errs  = {}
 	
-	for peak in all_IDs[j]:
-		if peak.mz < s.mz[0] or peak.mz > s.mz[len(s.mz)-1]: # out of the m/z range
-			kill = True
-			break
+	# cycle through all fragments
+	for j in IDs:
+		t = []
+		e = []
 		
-		if peak.mz in wherecache:
-			EID.append(wherecache[peak.mz])
-		else:
-			near = s.hasPeak(peak.mz)
+		kill = False # variable to determine whether to kill or not
+		
+		# get first peak to determine precision
+		peak = IDs[j][0]
+		if peak.mz < spec.mz[0] or peak.mz > spec.mz[len(spec.mz)-1]: # out of the m/z range
+			continue
+		else: # first peak is in m/z range
+			near = spec.hasPeak(peak.mz)
 			
-			val = 0
+			val  = 0
 			for k in near:
 				if k[1] > val:
+					loc = k[0]
 					val = k[1]
 			
 			if val == 0:
-				val = 1e-6
-			EID.append(val)
-			wherecache[peak.mz] = val
-		
-		TID.append(peak.intensity)
-	
-	if not kill: # make sure ID is all in m/z range
-		EI = np.array(EID)/sum(EID)
-		TI = np.array(TID)
-		g  = 2 * np.sum(EI * np.log(EI/TI))
-		
-		found_IDs[j] = g
-		mono_int[j]  = EID[0]
-'''
-
-# cycle through fragments
-for j in all_IDs:
-	TID = []
-	EID = []
-	
-	kill = False # variable to determine whether to kill or not
-	
-	# get first peak to determine precision
-	peak = all_IDs[j][0]
-	if peak.mz < s.mz[0] or peak.mz > s.mz[len(s.mz)-1]: # out of the m/z range
-		continue
-	else: # first peak is in m/z range
-		near = s.hasPeak(peak.mz)
-		
-		val  = 0
-		for k in near:
-			if k[1] > val:
-				loc = k[0]
-				val = k[1]
-		
-		if val == 0:
-			kill = True
-		else:
-			diff = peak.mz - loc
-			ppm  = 1e6 * ((loc - peak.mz)/peak.mz)
-		
-		TID.append(peak.intensity)
-		EID.append(val)
-	
-	if kill:
-		continue
-	
-	# cycle through remaining peaks
-	for peak in all_IDs[j][1:len(all_IDs[j])]:
-		if peak.mz < s.mz[0] or peak.mz > s.mz[len(s.mz)-1]: # out of the m/z range
-			kill = True
-			break
+				kill = True
+			else:
+				diff = peak.mz - loc
+				ppm  = 1e6 * ((loc - peak.mz)/peak.mz)
 			
-		near = s.hasPeak(peak.mz)
+			t.append(peak.intensity)
+			e.append(val)
 		
-		val  = 0
-		prec = 1000000
-		for k in near:
-			if peak.mz - k[0] - diff < prec:
-				val = k[1]
+		if kill:
+			continue
 		
-		if val == 0:
-			val = 1e-100
+		# cycle through remaining peaks
+		for peak in IDs[j][1:len(IDs[j])]:
+			if peak.mz < spec.mz[0] or peak.mz > spec.mz[len(spec.mz)-1]: # out of the m/z range
+				kill = True
+				break
+				
+			near = spec.hasPeak(peak.mz)
+			
+			val  = 0
+			prec = 1000000
+			for k in near:
+				if abs(peak.mz - k[0] - diff) < prec:
+					val  = k[1]
+					prec = abs(peak.mz - k[0] - diff)
+			
+			if val == 0:
+				val = 1e-100
+			
+			e.append(val)
+			t.append(peak.intensity)
 		
-		EID.append(val)
-		TID.append(peak.intensity)
+		if not kill:
+			EI = np.array(e)/sum(e)
+			TI = np.array(t)
+			
+			g  = 2 * np.sum(EI * np.log(EI/TI))
+			
+			found[j] = g
+			m_int[j] = e[0]
+			m_mz [j] = loc
+			errs[j]  = ppm
 	
-	if not kill:
-		EI = np.array(EID)/sum(EID)
-		TI = np.array(TID)
-		
-		g  = 2 * np.sum(EI * np.log(EI/TI))
-		
-		found_IDs[j] = g
-		mono_int[j]  = EID[0]
-		mono_mz[j]   = loc
-		errors[j]    = ppm
+	return [found, m_int, m_mz, errs]
 
-print "Done!"
-print "Tested " + str(len(found_IDs)) + " out of " + str(len(all_IDs)) + " fragments"
-
-# rank the fragments by G-score
-rank = sorted(found_IDs.items(), key=lambda x: x[1], reverse=False)
-
-# get top hits
-if top_n is not None: # user wants top n hits
-	top = rank[:top_n]
-else: # user wants top percentile hits
-	pct = top_p/100.0
-	ct  = int(pct * len(found_IDs))
+# main function
+def main():
+	################################
+	# Step 1: check user arguments #
+	################################
 	
-	top = rank[:ct]
-
-print "Printing output to file...",
-
-# write to file
-oFile = dFile[:-5] + '.txt'
-f  = open(oFile, 'w')
-f.write("m/z\tIntensity\tCharge\tFragments\tG-score\tError (ppm)\n")
-
-for q in top:
-	out = str(mono_mz[q[0]])+'\t'+str(mono_int[q[0]])+'\t'+str(all_IDs[q[0]][0].charge)+'\t'
-	for ions in all_forms[q[0][0]]:
-		out += ions + '; '
+	print "Checking user arguments...",
 	
-	out = out[:-2] + '\t'
-	out += str(found_IDs[q[0]]) + '\t' + str(errors[q[0]]) + '\n'
-	f.write(out)
+	# initiate parser
+	parser = argparse.ArgumentParser(description='Find isotopic clusters in GAG tandem mass spectra.')
+	
+	# add arguments
+	parser.add_argument('-c', required=True, help='GAG class (required)')
+	parser.add_argument('-i', required=True, help='Input mzML file (required)')
+	parser.add_argument('-r', required=False, help='Reducing end derivatization (optional)')
+	parser.add_argument('-n', type=int, required=False, help='Number of top results to return (either)')
+	parser.add_argument('-p', type=float, required=False, help='Percentage of top results to return (either)')
+	parser.add_argument('-a', required=False, help='Which metal is adducted (optional)')
+	parser.add_argument('-t', type=int, required=False, help='Number of adducted metals (required if -a TRUE)')
+	parser.add_argument('-g', required=False, help='Reagent used (optional)')
+	parser.add_argument('-m', type=float, required=False, help='Precursor m/z (optional, but must be in mzML file)')
+	parser.add_argument('-z', type=int, required=False, help='Precursor charge (optional, but must be in mzML file)')
+	parser.add_argument('-s', type=int, required=False, help='Number of sulfate losses to consider (optional, default 0)')
+	parser.add_argument('-x', required=False, help='Has the noise already been removed? (y/n)')
+	
+	# parse arguments
+	args = parser.parse_args()
+	
+	# get arguments into proper variables
+	gClass  = args.c
+	dFile   = args.i
+	fmla    = args.r
+	top_n   = args.n
+	top_p   = args.p
+	adduct  = args.a
+	nMetal  = args.t
+	reag    = args.g
+	pre_mz  = args.m
+	pre_z   = args.z
+	s_loss  = args.s
+	removed = args.x
+	
+	# get values ready for reducing end derivatization and reagent
+	df    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
+	rf    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
+	atoms = ['C','H','O','N','S']
+	
+	# check to make sure a proper GAG class was added
+	if gClass not in ['HS', 'CS', 'KS']:
+		print "You must denote a GAG class, either HS, CS, or KS. Try 'python gagfinder.py --help'"
+		sys.exit()
+	
+	# pick a proper class number
+	if gClass == 'HS':
+		cNum = 3
+	elif gClass == 'CS':
+		cNum = 1
+	else:
+		cNum = 4
+	
+	# parse the reducing end derivatization formula
+	if fmla:
+		parts = re.findall(r'([A-Z][a-z]*)(\d*)', fmla.upper()) # split formula by symbol
+		for q in parts:
+			if q[0] not in atoms: # invalid symbol entered
+				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
+				sys.exit()
+			else:
+				if q[1] == '': # only one of this atom
+					df[q[0]] += 1
+				else:
+					df[q[0]] += int(q[1])
+	
+	# parse the reagent formula
+	if reag:
+		parts = re.findall(r'([A-Z][a-z]*)(\d*)', reag.upper()) # split formula by symbol
+		for q in parts:
+			if q[0] not in atoms: # invalid symbol entered
+				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
+				sys.exit()
+			else:
+				if q[1] == '': # only one of this atom
+					rf[q[0]] += 1
+				else:
+					rf[q[0]] += int(q[1])
+	
+	# get derivatization weight
+	wt = {'C':  12.0,
+	      'H':  1.0078250322,
+	      'O':  15.994914620,
+	      'N':  14.003074004,
+	      'S':  31.972071174,
+	      'Na': 22.98976928,
+	      'K':  38.96370649,
+	      'Li': 7.01600344,
+	      'Ca': 39.9625909,
+	      'Mg': 23.98504170}
+	dw = 0
+	for q in df:
+		dw += df[q] * wt[q]
+	
+	# get reagent weight
+	rw = 0
+	for q in rf:
+		rw += rf[q] * wt[q]
+	
+	# check to make sure that metal adduct is appropriate
+	if adduct:
+		if adduct not in ['Na', 'K', 'Li', 'Ca', 'Mg']:
+			print "\nInvalid metal adduct entered. Only Na, K, Li, Ca, and Mg are accepted. Try 'python gagfinder.py --help'"
+			sys.exit()
+		
+		if nMetal is None:
+			nMetal = 0
+		elif nMetal < 1:
+			print "\nYou must enter a positive integer for the number of adducted metals. Try 'python gagfinder.py --help'"
+			sys.exit()
+	
+	# check to make sure user didn't input both a top n and a top percentile
+	if top_n and top_p:
+		print "You must select either a number or a percentile to return, not both. Try 'python gagfinder.py -h'"
+		sys.exit()
+	
+	# check to see if the user wants to consider sulfate loss
+	if not s_loss:
+		s_loss = 0
+	
+	# check to make sure user did input at least one of top n or top percentile
+	if not top_n and not top_p:
+		print "You must select a number or a percentile to return. Try 'python gagfinder.py -h'"
+		sys.exit()
+	
+	# check to see if the user removed the noise to start with
+	if not removed:
+		removed = False
+	else:
+		# check to make sure the entry was correct
+		if removed == 'y' or removed == 'n':
+			if removed == 'y':
+				removed = True
+			else:
+				removed = False
+		else:
+			print "You must enter either 'y' or 'n' for whether the noise has been removed or not. Try 'python gagfinder.py -h'"
+			sys.exit()
+	
+	# print the system arguments back out to the user
+	if debug:
+		print "class: %s" % (gClass)
+		print "mzML file: %s" % (dFile)
+		if 'top_n' in globals():
+			print "top %i fragments requested" % (top_n)
+		else:
+			print "top %.2f%% percent of fragments requested" % (top_p)
+		
+		formula = ''
+		for key in df:
+			val = df[key]
+			if val > 0:
+				formula += key
+				if val > 1:
+					formula += str(val)
+		print "atoms in reducing end derivatization: %s" % (formula)
+	
+	print "Done!"
+	
+	############################################
+	# Step 2: Load mzml file and connect to DB #
+	############################################
+	
+	print "Loading mzml file and connecting to GAGfragDB...",
+	
+	# from user, under construction
+	d = pymzml.run.Reader(dFile, MSn_Precision=5e-06) # get mzML file into object
+	s = pymzml.spec.Spectrum(measuredPrecision=20e-06) # initialize new Spectrum object
+	
+	# connect to GAGfragDB
+	conn = sq.connect('../lib/GAGfragDB.db')
+	c    = conn.cursor()
+	
+	print "Done!"
+	
+	######################
+	# Step 3a: Sum scans #
+	######################
+	
+	print "Summing scans...",
+	
+	s = sum_scans(d, s, removed) # sum scans
+	
+	print "Done!"
 
-f.close()
+	#######################################
+	# Step 3b: Find precursor composition #
+	#######################################
+	
+	print "Finding precursor composition...",
+	
+	id, pFmla, pComp, tMass = get_precursor(pre_z, pre_mz, c, dw, wt, cNum, adduct, nMetal) # get info about precursor
+	
+	print "Done!"
+	
+	##########################################################
+	# Step 3c: Get reducing end/non-reducing end information #
+	##########################################################
+	
+	print "Determining reducing end/non-reducing end information...",
+	
+	# convert composition into a dictionary
+	pDict         = fmla2dict(pComp, 'composition')
+	NR, RE, n_pre = get_ends(pDict, cNum)
+	
+	print "Done!"
+	
+	#######################################################################
+	# Step 3d: Get potential fragment ions based on precursor composition #
+	#######################################################################
+	
+	print "Retrieving all potential fragment ions for precursor with composition " + pComp + "...",
+	
+	# get all isotopic distributions
+	all_IDs, all_forms = get_frags(pFmla, pDict, s_loss, rf, df, pre_z, n_pre, c, id, xmod, RE, adduct, nMetal)
+	
+	print "Done!"
+	
+	##############################################
+	# Step 3e: Score each potential fragment ion #
+	##############################################
+	
+	print "Scoring all potential fragment ions for precursor with composition " + pComp + "...",
+	
+	# score all fragments
+	found_IDs, mono_int, mono_mz, errors = score_frags(all_IDs, s)
+	
+	print "Tested " + str(len(found_IDs)) + " out of " + str(len(all_IDs)) + " fragments"
+	
+	# rank the fragments by G-score
+	rank = sorted(found_IDs.items(), key=lambda x: x[1], reverse=False)
+	
+	# get top hits
+	if top_n: # user wants top n hits
+		top = rank[:top_n]
+	else: # user wants top percentile hits
+		pct = top_p/100.
+		ct  = int(pct * len(found_IDs))
+		
+		top = rank[:ct]
+	
+	print "Done!"
+	print "Printing output to file...",
+	
+	# write to file
+	oFile = dFile[:-5] + '.txt'
+	f  = open(oFile, 'w')
+	f.write("m/z\tIntensity\tCharge\tFragments\tG-score\tError (ppm)\n")
+	
+	for q in top:
+		out = str(mono_mz[q[0]])+'\t'+str(mono_int[q[0]])+'\t'+str(all_IDs[q[0]][0].charge)+'\t'
+		for ions in all_forms[q[0][0]]:
+			out += ions + '; '
+		
+		out = out[:-2] + '\t'
+		out += str(found_IDs[q[0]]) + '\t' + str(errors[q[0]]) + '\n'
+		f.write(out)
+	
+	f.close()
+	
+	print "Finished!"
+	print time.time() - start_time
 
-print "Finished!"
-print time.time() - start_time
+# run main
+main()
