@@ -618,6 +618,173 @@ def score_frags(IDs, spec):
 	
 	return [found, m_int, m_mz, errs]
 
+# function for running the guts of GAGfinder
+def find_gags(mzml_path, gag_class, re_form, N, P, metal, metal_ct, reagent, mz, chg, so3loss, noise_gone, db_path='../lib/GAGfragDB.db'):
+	# get values ready for reducing end derivatization and reagent
+	df    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
+	rf    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
+	atoms = ['C','H','O','N','S']
+	
+	# pick a proper class number
+	if gag_class == 'HS':
+		cNum = 3
+	elif gag_class == 'CS':
+		cNum = 1
+	else:
+		cNum = 4
+	
+	# parse the reducing end derivatization formula
+	if re_form:
+		parts = re.findall(r'([A-Z][a-z]*)(\d*)', re_form.upper()) # split formula by symbol
+		for q in parts:
+			if q[0] not in atoms: # invalid symbol entered
+				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
+				sys.exit()
+			else:
+				if q[1] == '': # only one of this atom
+					df[q[0]] += 1
+				else:
+					df[q[0]] += int(q[1])
+	
+	# parse the reagent formula
+	if reagent:
+		parts = re.findall(r'([A-Z][a-z]*)(\d*)', reagent.upper()) # split formula by symbol
+		for q in parts:
+			if q[0] not in atoms: # invalid symbol entered
+				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
+				sys.exit()
+			else:
+				if q[1] == '': # only one of this atom
+					rf[q[0]] += 1
+				else:
+					rf[q[0]] += int(q[1])
+	
+	# get derivatization weight
+	wt = {'C':  12.0,
+	      'H':  1.0078250322,
+	      'O':  15.994914620,
+	      'N':  14.003074004,
+	      'S':  31.972071174,
+	      'Na': 22.98976928,
+	      'K':  38.96370649,
+	      'Li': 7.01600344,
+	      'Ca': 39.9625909,
+	      'Mg': 23.98504170}
+	dw = 0
+	for q in df:
+		dw += df[q] * wt[q]
+	
+	# get reagent weight
+	rw = 0
+	for q in rf:
+		rw += rf[q] * wt[q]
+	
+	############################################
+	# Step 2: Load mzml file and connect to DB #
+	############################################
+	
+	print "Loading mzml file and connecting to GAGfragDB...",
+	
+	# from user, under construction
+	d = pymzml.run.Reader(mzml_path, MSn_Precision=5e-06) # get mzML file into object
+	s = pymzml.spec.Spectrum(measuredPrecision=20e-06) # initialize new Spectrum object
+	
+	# connect to GAGfragDB
+	conn = sq.connect(db_path)
+	c    = conn.cursor()
+	
+	print "Done!"
+	
+	######################
+	# Step 3a: Sum scans #
+	######################
+	
+	print "Summing scans...",
+	
+	s = sum_scans(d, s, noise_gone) # sum scans
+	
+	print "Done!"
+
+	#######################################
+	# Step 3b: Find precursor composition #
+	#######################################
+	
+	print "Finding precursor composition...",
+	
+	id, pFmla, pComp, tMass = get_precursor(chg, mz, c, dw, wt, cNum, metal, metal_ct) # get info about precursor
+	
+	print "Done!"
+	
+	##########################################################
+	# Step 3c: Get reducing end/non-reducing end information #
+	##########################################################
+	
+	print "Determining reducing end/non-reducing end information...",
+	
+	# convert composition into a dictionary
+	pDict         = fmla2dict(pComp, 'composition')
+	NR, RE, n_pre = get_ends(pDict, cNum)
+	
+	print "Done!"
+	
+	#######################################################################
+	# Step 3d: Get potential fragment ions based on precursor composition #
+	#######################################################################
+	
+	print "Retrieving all potential fragment ions for precursor with composition " + pComp + "...",
+	
+	# get all isotopic distributions
+	all_IDs, all_forms = get_frags(pFmla, pDict, so3loss, rf, df, chg, n_pre, c, id, xmod, RE, metal, metal_ct)
+	
+	print "Done!"
+	
+	##############################################
+	# Step 3e: Score each potential fragment ion #
+	##############################################
+	
+	print "Scoring all potential fragment ions for precursor with composition " + pComp + "...",
+	
+	# score all fragments
+	found_IDs, mono_int, mono_mz, errors = score_frags(all_IDs, s)
+	
+	print "Tested " + str(len(found_IDs)) + " out of " + str(len(all_IDs)) + " fragments"
+	
+	# rank the fragments by G-score
+	rank = sorted(found_IDs.items(), key=lambda x: x[1], reverse=False)
+	
+	# get top hits
+	if N: # user wants top n hits
+		top = rank[:N]
+	else: # user wants top percentile hits
+		pct = P/100.
+		ct  = int(pct * len(found_IDs))
+		
+		top = rank[:ct]
+	
+	# return
+	return [top, found_IDs, mono_int, mono_mz, errors, all_IDs, all_forms]
+
+# function for writing to file
+def write_result_to_file(mzml_path, scores, fids, m_mz, m_int, all_dist, formulae, errs):
+	print "Done!"
+	print "Printing output to file...",
+	
+	# write to file
+	oFile = mzml_path[:-5] + '.txt'
+	f     = open(oFile, 'w')
+	f.write("m/z\tIntensity\tCharge\tFragments\tG-score\tError (ppm)\n")
+	
+	for q in scores:
+		out = str(m_mz[q[0]])+'\t'+str(m_int[q[0]])+'\t'+str(all_dist[q[0]][0].charge)+'\t'
+		for ions in formulae[q[0][0]]:
+			out += ions + '; '
+		
+		out = out[:-2] + '\t'
+		out += str(fids[q[0]]) + '\t' + str(errs[q[0]]) + '\n'
+		f.write(out)
+	
+	f.close()
+
 # main function
 def main():
 	################################
@@ -660,69 +827,10 @@ def main():
 	s_loss  = args.s
 	removed = args.x
 	
-	# get values ready for reducing end derivatization and reagent
-	df    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
-	rf    = {'C':0, 'H':0, 'O':0, 'N':0, 'S':0}
-	atoms = ['C','H','O','N','S']
-	
 	# check to make sure a proper GAG class was added
 	if gClass not in ['HS', 'CS', 'KS']:
 		print "You must denote a GAG class, either HS, CS, or KS. Try 'python gagfinder.py --help'"
 		sys.exit()
-	
-	# pick a proper class number
-	if gClass == 'HS':
-		cNum = 3
-	elif gClass == 'CS':
-		cNum = 1
-	else:
-		cNum = 4
-	
-	# parse the reducing end derivatization formula
-	if fmla:
-		parts = re.findall(r'([A-Z][a-z]*)(\d*)', fmla.upper()) # split formula by symbol
-		for q in parts:
-			if q[0] not in atoms: # invalid symbol entered
-				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
-				sys.exit()
-			else:
-				if q[1] == '': # only one of this atom
-					df[q[0]] += 1
-				else:
-					df[q[0]] += int(q[1])
-	
-	# parse the reagent formula
-	if reag:
-		parts = re.findall(r'([A-Z][a-z]*)(\d*)', reag.upper()) # split formula by symbol
-		for q in parts:
-			if q[0] not in atoms: # invalid symbol entered
-				print "Invalid chemical formula entered. Please enter only CHONS. Try 'python gagfinder.py --help'"
-				sys.exit()
-			else:
-				if q[1] == '': # only one of this atom
-					rf[q[0]] += 1
-				else:
-					rf[q[0]] += int(q[1])
-	
-	# get derivatization weight
-	wt = {'C':  12.0,
-	      'H':  1.0078250322,
-	      'O':  15.994914620,
-	      'N':  14.003074004,
-	      'S':  31.972071174,
-	      'Na': 22.98976928,
-	      'K':  38.96370649,
-	      'Li': 7.01600344,
-	      'Ca': 39.9625909,
-	      'Mg': 23.98504170}
-	dw = 0
-	for q in df:
-		dw += df[q] * wt[q]
-	
-	# get reagent weight
-	rw = 0
-	for q in rf:
-		rw += rf[q] * wt[q]
 	
 	# check to make sure that metal adduct is appropriate
 	if adduct:
@@ -730,10 +838,12 @@ def main():
 			print "\nInvalid metal adduct entered. Only Na, K, Li, Ca, and Mg are accepted. Try 'python gagfinder.py --help'"
 			sys.exit()
 		
-		if nMetal is None:
-			nMetal = 0
-		elif nMetal < 1:
+		if nMetal is None or nMetal < 1:
 			print "\nYou must enter a positive integer for the number of adducted metals. Try 'python gagfinder.py --help'"
+			sys.exit()
+	else:
+		if nMetal:
+			print "\nYou did not select a metal adduct, only the number. Try 'python gagfinder.py --help'"
 			sys.exit()
 	
 	# check to make sure user didn't input both a top n and a top percentile
@@ -784,106 +894,20 @@ def main():
 	
 	print "Done!"
 	
-	############################################
-	# Step 2: Load mzml file and connect to DB #
-	############################################
+	# run the guts of GAGfinder
+	result = find_gags(dFile, gClass, fmla, top_n, top_p, adduct, nMetal, reag, pre_mz, pre_z, s_loss, removed)
 	
-	print "Loading mzml file and connecting to GAGfragDB...",
-	
-	# from user, under construction
-	d = pymzml.run.Reader(dFile, MSn_Precision=5e-06) # get mzML file into object
-	s = pymzml.spec.Spectrum(measuredPrecision=20e-06) # initialize new Spectrum object
-	
-	# connect to GAGfragDB
-	conn = sq.connect('../lib/GAGfragDB.db')
-	c    = conn.cursor()
-	
-	print "Done!"
-	
-	######################
-	# Step 3a: Sum scans #
-	######################
-	
-	print "Summing scans...",
-	
-	s = sum_scans(d, s, removed) # sum scans
-	
-	print "Done!"
-
-	#######################################
-	# Step 3b: Find precursor composition #
-	#######################################
-	
-	print "Finding precursor composition...",
-	
-	id, pFmla, pComp, tMass = get_precursor(pre_z, pre_mz, c, dw, wt, cNum, adduct, nMetal) # get info about precursor
-	
-	print "Done!"
-	
-	##########################################################
-	# Step 3c: Get reducing end/non-reducing end information #
-	##########################################################
-	
-	print "Determining reducing end/non-reducing end information...",
-	
-	# convert composition into a dictionary
-	pDict         = fmla2dict(pComp, 'composition')
-	NR, RE, n_pre = get_ends(pDict, cNum)
-	
-	print "Done!"
-	
-	#######################################################################
-	# Step 3d: Get potential fragment ions based on precursor composition #
-	#######################################################################
-	
-	print "Retrieving all potential fragment ions for precursor with composition " + pComp + "...",
-	
-	# get all isotopic distributions
-	all_IDs, all_forms = get_frags(pFmla, pDict, s_loss, rf, df, pre_z, n_pre, c, id, xmod, RE, adduct, nMetal)
-	
-	print "Done!"
-	
-	##############################################
-	# Step 3e: Score each potential fragment ion #
-	##############################################
-	
-	print "Scoring all potential fragment ions for precursor with composition " + pComp + "...",
-	
-	# score all fragments
-	found_IDs, mono_int, mono_mz, errors = score_frags(all_IDs, s)
-	
-	print "Tested " + str(len(found_IDs)) + " out of " + str(len(all_IDs)) + " fragments"
-	
-	# rank the fragments by G-score
-	rank = sorted(found_IDs.items(), key=lambda x: x[1], reverse=False)
-	
-	# get top hits
-	if top_n: # user wants top n hits
-		top = rank[:top_n]
-	else: # user wants top percentile hits
-		pct = top_p/100.
-		ct  = int(pct * len(found_IDs))
-		
-		top = rank[:ct]
-	
-	print "Done!"
-	print "Printing output to file...",
+	# get individual stuff into variables
+	output   = result[0]
+	f_IDs    = result[1]
+	monint   = result[2]
+	monmz    = result[3]
+	mistakes = result[4]
+	a_IDs    = result[5]
+	a_forms  = result[6]
 	
 	# write to file
-	oFile = dFile[:-5] + '.txt'
-	f  = open(oFile, 'w')
-	f.write("m/z\tIntensity\tCharge\tFragments\tG-score\tError (ppm)\n")
-	
-	for q in top:
-		out = str(mono_mz[q[0]])+'\t'+str(mono_int[q[0]])+'\t'+str(all_IDs[q[0]][0].charge)+'\t'
-		for ions in all_forms[q[0][0]]:
-			out += ions + '; '
-		
-		out = out[:-2] + '\t'
-		out += str(found_IDs[q[0]]) + '\t' + str(errors[q[0]]) + '\n'
-		f.write(out)
-	
-	f.close()
+	write_result_to_file(dFile, output, f_IDs, monmz, monint, a_IDs, a_forms, mistakes)
 	
 	print "Finished!"
 	print time.time() - start_time
