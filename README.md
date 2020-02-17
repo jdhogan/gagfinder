@@ -20,7 +20,7 @@ In order to run GAGfinder, you need to open a Command Prompt and make your way t
 
 Now you are in this directory. However, the GAGfinder executable is in a sub-directory of this directory, called gagfinder-cli. You will need to execute the following command to get to that directory and list the files and folders in it (everything after the '>' symbol):
 
-[prompt]>cd gagfinder-cli
+[prompt]>cd gagfinder-cli\n
 [prompt]>dir
 
 Amongst all of these files and directories should be an executable file called 'gagfinder-cli.exe'. This is your executable file to run GAGfinder. Execute the following command to ensure that the installation was successful.
